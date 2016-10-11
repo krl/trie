@@ -1,0 +1,10 @@
+[package]
+authors = ["Kristoffer Ström <kristoffer@ethcore.io>"]
+name = "trie"
+version = "0.1.0"
+
+[dependencies]
+byteorder = "0.5.3"
+
+[dependencies.content]
+path = "../content"
