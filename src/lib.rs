@@ -9,7 +9,7 @@ use parking_lot::RwLock;
 
 use std::fmt::{self, Debug};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Child<K, V> {
     Trie(Trie<K, V>),
     Leaf {
@@ -38,12 +38,6 @@ impl<K, V> Children<K, V> {
     fn take(&mut self, i: usize) -> Child<K, V> {
         mem::replace(&mut self.0[i], Child::None)
     }
-}
-
-#[derive(Debug)]
-struct Cursor<K, V> {
-    trie: Trie<K, V>,
-    pos: usize,
 }
 
 #[derive(Clone)]
@@ -107,31 +101,13 @@ impl<K, V> Trie<K, V>
     //     }
     // }
 
-    fn branch(&self, key: &K) -> Vec<Cursor<K, V>> {
-        let mut branch = vec![];
-        self.branch_depth(key, 0, &mut branch);
-        branch
-    }
-
-    fn branch_depth<'a>(&'a self,
-                        key: &K,
-                        depth: usize,
-                        branch: &mut Vec<Cursor<K,V>>) {
-        let i = nibble(key.as_ref(), depth);
-        branch.push(Cursor { trie: self.clone(), pos: i});
-        match self.children.read()[i] {
-            Child::Trie(ref trie) => {
-                trie.branch_depth(key, depth + 1, branch)
-            },
-            _ => (),
-        }
-    }
-
     pub fn insert(&mut self, key: K, val: V) {
-        let branch = self.branch(&key);
-        let last = branch.last().expect("no zero length branches possible");
-        let mut children = last.trie.children.write();
-        let ref mut child = children[last.pos];
+        self.insert_depth(key, val, 0)
+    }
+
+    fn insert_depth(&mut self, key: K, val: V, depth: usize) {
+        let i = nibble(key.as_ref(), depth);
+        let ref mut child = self.children.write()[i];
         match *child {
             Child::None => *child = Child::Leaf { key: key, val: val },
             Child::Leaf { .. } => {
@@ -144,70 +120,69 @@ impl<K, V> Trie<K, V>
                                                             leafval,
                                                             key,
                                                             val,
-                                                            branch.len()));
+                                                            depth + 1));
                     }
                 } else {
                     unreachable!();
                 }
+            },
+            Child::Trie(ref mut trie) => {
+                trie.insert_depth(key, val, depth + 1);
             }
-            _ => unimplemented!(),
         }
     }
 
     pub fn remove(&mut self, key: &K) {
-        let mut branch = self.branch(&key);
+        self.remove_depth(key, 0);
+    }
+
+    fn remove_depth(&mut self, key: &K, depth: usize) -> Option<Child<K, V>> {
+        let i = nibble(key.as_ref(), depth);
         {
-            let last = branch.last().expect("no zero length branches possible");
-            let mut children = last.trie.children.write();
-            let ref mut child = children[last.pos];
-            let mut newchild = None;
+            let mut writelock = self.children.write();
+            let ref mut child = writelock[i];
+            let mut overwrite = None;
             match *child {
                 Child::Leaf { key: ref leafkey, .. } if key == leafkey => {
-                    newchild = Some(Child::None)
+                    overwrite = Some(Child::None)
                 },
                 Child::None | Child::Leaf{ .. } => (),
-                Child::Trie(_) => unreachable!("trie child at end of branch"),
-            }
-            newchild.map(|new| {
-                *child = new
-            });
-        }
-        if branch.len() > 1 {
-            println!("A");
-            // count the number of branch levels with only one
-            // entry, and collapse them into one leaf.
-            let mut collapse = None;
-            {
-                let cursor = branch.last().expect("> 1");
-                if let Some(idx) = cursor.trie.singleton() {
-                    collapse = Some(cursor.trie.children.write().take(idx));
-                    println!("COLLAPSE {:?}", collapse);
+                Child::Trie(ref mut trie) => {
+                    overwrite = trie.remove_depth(key, depth + 1);
                 }
-            };
-
-            // poor souls do-loop
-            while {
-                branch.pop();
-                branch.len() > 1 &&
-                    branch.last().expect("> 0").trie.singleton().is_some()
-            } {}
-
-            collapse.map(|insert| {
-                let cursor = branch.last().expect("> 0");
-                cursor.trie.children.write()[cursor.pos] = insert
-            });
+            }
+            overwrite.map(|c| { *child = c });
+        }
+        if depth > 0 {
+            let mut singleton = None;
+            let mut children = self.children.write();
+            for i in 0..16 {
+                if let Child::None = children[i] {
+                } else if singleton == None {
+                    singleton = Some(i);
+                } else {
+                    return None
+                }
+            }
+            singleton.map(|idx| {
+                children.take(idx)
+            })
+        } else {
+            None
         }
     }
 
     pub fn get(&self, key: &K) -> Option<V> {
-        let branch = self.branch(&key);
-        let last = branch.last().expect("no zero length branches");
-        let children = last.trie.children.read();
-        match children[last.pos] {
+        self.get_depth(key, 0)
+    }
+
+    pub fn get_depth(&self, key: &K, depth: usize) -> Option<V> {
+        let i = nibble(key.as_ref(), depth);
+        match self.children.read()[i] {
             Child::Leaf { key: ref leafkey, ref val } if leafkey == key =>
                 Some(val.clone()),
             Child::Leaf { .. } | Child::None => None,
-            Child::Trie(_) => unreachable!("trie child at end of branch"),
+            Child::Trie(ref trie) => trie.get_depth(key, depth + 1)
         }
     }
 
@@ -222,31 +197,7 @@ impl<K, V> Trie<K, V>
         }
         true
     }
-
-    fn singleton(&self) -> Option<usize> {
-        let children = self.children.read();
-        let mut singleton = None;
-        for i in 0..16 {
-            if let Child::None = children[i] {
-            } else if singleton == None {
-                singleton = Some(i);
-            } else {
-                return None
-            }
-        }
-        singleton
-    }
 }
-
-// pub fn disambiguate_paths<K>(a: K, b: K, offset: usize)
-//     -> (Vec<usize>, usize, usize)
-//     where K: PartialEq + AsRef<[u8]> + Debug + Clone
-// {
-//     let mut common = vec![];
-//     loop {
-
-//     }
-// }
 
 /// Gets the nibble at position i
 pub fn nibble(key: &[u8], i: usize) -> usize {
@@ -257,15 +208,32 @@ pub fn nibble(key: &[u8], i: usize) -> usize {
     }
 }
 
+impl<K, V> fmt::Debug for Child<K, V>
+    where K: Debug, V: Debug {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            Child::Leaf { ref val, .. } => {
+                write!(f, "{:#?}", val)
+            },
+            Child::Trie(ref t) => {
+                write!(f, "{:#?}", t)
+            },
+            _ => Ok(()),
+        }
+    }
+}
+
 impl<K, V> fmt::Debug for Children<K, V>
     where K: Debug, V: Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        try!(write!(f, "[ "));
         for i in 0..16 {
             if let Child::None = self.0[i] {
             } else {
-                try!(write!(f, "\n{}: {:#?}", i, self.0[i]));
+                try!(write!(f, "{:?} ", self.0[i]));
             }
         }
+        try!(write!(f, "]"));
         Ok(())
     }
 }
@@ -316,40 +284,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn removal() {
-        let lots = 100_000;
-        let mut trie = Trie::<[u8; 8], usize>::new();
-        for i in 0..lots {
-            trie.insert(hash(i), i);
-        }
+    // #[test]
+    // fn removal() {
+    //     let lots = 100_000;
+    //     let mut trie = Trie::<[u8; 8], usize>::new();
+    //     for i in 0..lots {
+    //         trie.insert(hash(i), i);
+    //     }
 
-        for i in 0..lots/2 {
-            trie.remove(&hash(i*2));
-        }
+    //     for i in 0..lots/2 {
+    //         trie.remove(&hash(i*2));
+    //     }
 
-        for i in 0..lots {
-            if i % 2 == 0 {
-                assert_eq!(trie.get(&hash(i)), None);
-            } else {
-                assert_eq!(trie.get(&hash(i)), Some(i));
-            }
-        }
-    }
+    //     for i in 0..lots {
+    //         if i % 2 == 0 {
+    //             assert_eq!(trie.get(&hash(i)), None);
+    //         } else {
+    //             assert_eq!(trie.get(&hash(i)), Some(i));
+    //         }
+    //     }
+    // }
 
     #[test]
     fn remove_all() {
+        let from = 17;
         let lots = 20;
         let mut trie = Trie::<[u8; 8], usize>::new();
-        for i in 0..lots {
+        for i in from..lots {
             trie.insert(hash(i), i as usize);
         }
 
-        for i in 0..lots {
+        println!("ALL: {:?}", trie);
+
+        for i in from..lots {
             trie.remove(&hash(i));
+            println!("removed {} {:?}", i, trie);
         }
 
-        for i in 0..lots {
+        for i in from..lots {
             assert_eq!(trie.get(&hash(i)), None);
         }
 
