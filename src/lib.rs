@@ -3,14 +3,13 @@ extern crate parking_lot;
 use std::mem;
 use std::sync::Arc;
 use std::ops::{Index, IndexMut};
-use std::sync::atomic::{AtomicBool, // Ordering
-};
-use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use parking_lot::{RwLock, RwLockWriteGuard, RwLockReadGuard};
 
 use std::fmt::{self, Debug};
 
 #[derive(Clone)]
-enum Child<K, V> {
+pub enum Child<K, V> {
     Trie(Trie<K, V>),
     Leaf {
         key: K,
@@ -25,7 +24,7 @@ enum RemoveResult<K, V> {
     PassUp(Child<K, V>),
 }
 
-struct Children<K, V>([Child<K, V>; 16]);
+pub struct Children<K, V>([Child<K, V>; 16]);
 
 impl<K, V> Index<usize> for Children<K, V> {
     type Output = Child<K, V>;
@@ -40,10 +39,19 @@ impl<K, V> IndexMut<usize> for Children<K, V> {
     }
 }
 
-#[derive(Clone)]
 pub struct Trie<K, V> {
     children: Arc<RwLock<Children<K, V>>>,
     cow: Arc<AtomicBool>,
+}
+
+impl<K, V> Clone for Trie<K, V> {
+    fn clone(&self) -> Self {
+        self.cow.store(true, Ordering::Relaxed);
+        Trie {
+            children: self.children.clone(),
+            cow: self.cow.clone(),
+        }
+    }
 }
 
 impl<K, V> Children<K, V> {
@@ -93,48 +101,64 @@ impl<K, V> Trie<K, V>
         }
     }
 
-    fn put(&self, idx: usize, child: Child<K, V>) {
-        self.children.write()[idx] = child;
+    fn put(&mut self, idx: usize, child: Child<K, V>, cow: Arc<AtomicBool>) {
+        self.writable_children(cow)[idx] = child;
     }
 
-    fn new_from(akey: K, aval: V, bkey: K, bval: V, depth: usize) -> Self {
-        let trie = Trie::new();
+    fn new_from(akey: K,
+                aval: V,
+                bkey: K,
+                bval: V,
+                depth: usize,
+                cow: Arc<AtomicBool>) -> Self {
+        let mut trie = Trie::new();
         let na = nibble(akey.as_ref(), depth);
         let nb = nibble(bkey.as_ref(), depth);
         if na == nb {
-            let newtrie = Trie::new_from(akey, aval, bkey, bval, depth + 1);
-            trie.put(na, Child::Trie(newtrie));
+            let newtrie = Trie::new_from(akey,
+                                         aval,
+                                         bkey,
+                                         bval,
+                                         depth + 1,
+                                         cow.clone());
+            trie.put(na, Child::Trie(newtrie), cow);
         } else {
-            trie.put(na, Child::Leaf { key: akey, val: aval });
-            trie.put(nb, Child::Leaf { key: bkey, val: bval });
+            trie.put(na, Child::Leaf { key: akey, val: aval }, cow.clone());
+            trie.put(nb, Child::Leaf { key: bkey, val: bval }, cow);
         }
         trie
     }
 
-    // fn ensure_writable(&mut self, cow: Arc<AtomicBool>) {
-    //     if self.cow.load(Ordering::Relaxed) {
-    //         // copy the children
-    //         let mut newchildren = Children::new();
-    //         {
-    //             let children = self.children.read();
-    //             for i in 0..16 {
-    //                 newchildren[i] = children[i].clone()
-    //             }
-    //         }
-    //         *self = Trie {
-    //             children: Arc::new(RwLock::new(newchildren)),
-    //             cow: cow,
-    //         }
-    //     }
-    // }
-
-    pub fn insert(&mut self, key: K, val: V) {
-        self.insert_depth(key, val, 0)
+    pub fn writable_children(&mut self, cow: Arc<AtomicBool>)
+                             -> RwLockWriteGuard<Children<K, V>> {
+        if self.cow.load(Ordering::Relaxed) {
+            // copy the children
+            let mut newchildren = Children::new();
+            {
+                let children = self.readable_children();
+                for i in 0..16 {
+                    newchildren[i] = children[i].clone()
+                }
+            }
+            *self = Trie {
+                children: Arc::new(RwLock::new(newchildren)),
+                cow: cow,
+            }
+        }
+        self.children.write()
     }
 
-    fn insert_depth(&mut self, key: K, val: V, depth: usize) {
+    pub fn readable_children(&self) -> RwLockReadGuard<Children<K, V>> {
+        self.children.read()
+    }
+
+    pub fn insert(&mut self, key: K, val: V) {
+        self.insert_depth(key, val, 0, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn insert_depth(&mut self, key: K, val: V, depth: usize, cow: Arc<AtomicBool>) {
         let i = nibble(key.as_ref(), depth);
-        let ref mut child = self.children.write()[i];
+        let ref mut child = self.writable_children(cow.clone())[i];
         match *child {
             Child::None => *child = Child::Leaf { key: key, val: val },
             Child::Leaf { .. } => {
@@ -147,33 +171,37 @@ impl<K, V> Trie<K, V>
                                                             leafval,
                                                             key,
                                                             val,
-                                                            depth + 1));
+                                                            depth + 1,
+                                                            cow));
                     }
                 } else {
                     unreachable!();
                 }
             },
             Child::Trie(ref mut trie) => {
-                trie.insert_depth(key, val, depth + 1);
+                trie.insert_depth(key, val, depth + 1, cow);
             }
         }
     }
 
     pub fn remove(&mut self, key: &K) {
-        self.remove_depth(key, 0);
+        self.remove_depth(key, 0, Arc::new(AtomicBool::new(false)));
     }
 
-    fn remove_depth(&mut self, key: &K, depth: usize) -> RemoveResult<K, V>
+    fn remove_depth(&mut self,
+                    key: &K,
+                    depth: usize,
+                    cow: Arc<AtomicBool>) -> RemoveResult<K, V>
     {
         let i = nibble(key.as_ref(), depth);
-        let ref mut writelock = self.children.write();
+        let ref mut writelock = self.writable_children(cow.clone());
         let result = match writelock[i] {
             Child::Leaf { key: ref leafkey, .. } if key == leafkey => {
                 RemoveResult::Clear
             },
             Child::None | Child::Leaf{ .. } => RemoveResult::Done,
             Child::Trie(ref mut trie) => {
-                match trie.remove_depth(key, depth + 1) {
+                match trie.remove_depth(key, depth + 1, cow) {
                     RemoveResult::PassUp(passed) => RemoveResult::PassUp(passed),
                     _ => RemoveResult::Done,
                 }
@@ -208,7 +236,7 @@ impl<K, V> Trie<K, V>
 
     pub fn get_depth(&self, key: &K, depth: usize) -> Option<V> {
         let i = nibble(key.as_ref(), depth);
-        match self.children.read()[i] {
+        match self.readable_children()[i] {
             Child::Leaf { key: ref leafkey, ref val } if leafkey == key =>
                 Some(val.clone()),
             Child::Leaf { .. } | Child::None => None,
@@ -218,7 +246,7 @@ impl<K, V> Trie<K, V>
 
     // test use only
     fn _empty(&self) -> bool {
-        let children = self.children.read();
+        let children = self.readable_children();
         for i in 0..16 {
             if let Child::None = children[i] {
             } else {
@@ -239,7 +267,8 @@ pub fn nibble(key: &[u8], i: usize) -> usize {
 }
 
 impl<K, V> fmt::Debug for Child<K, V>
-    where K: Debug, V: Debug {
+    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
+          V: Clone + Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
             Child::Leaf { ref val, .. } => {
@@ -254,7 +283,8 @@ impl<K, V> fmt::Debug for Child<K, V>
 }
 
 impl<K, V> fmt::Debug for Children<K, V>
-    where K: Debug, V: Debug {
+    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
+          V: Clone + Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         try!(write!(f, "[ "));
         for i in 0..16 {
@@ -269,9 +299,10 @@ impl<K, V> fmt::Debug for Children<K, V>
 }
 
 impl<K, V> fmt::Debug for Trie<K, V>
-    where K: Debug, V: Debug {
+    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
+          V: Clone + Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{:#?}", *self.children.read())
+        write!(f, "{:#?}", *self.readable_children())
     }
 }
 
@@ -358,42 +389,74 @@ mod tests {
         assert!(trie._empty());
     }
 
-    // #[test]
-    // fn copy_on_write() {
-    //     let mut a = Trie::<[u8; 8], usize>::new();
+    #[test]
+    fn copy_on_write() {
+        let mut a = Trie::<[u8; 8], usize>::new();
 
-    //     let junk = 100_000;
-    //     for i in 0..junk {
-    //         a.insert(hash(i + 10000), 999);
-    //     }
+        let junk = 100_000;
+        for i in 0..junk {
+            a.insert(hash(i + 10000), 999);
+        }
 
-    //     a.insert(hash(1), 10);
-    //     a.insert(hash(2), 20);
+        a.insert(hash(1), 10);
+        a.insert(hash(2), 20);
 
-    //     let mut b = a.clone();
+        let mut b = a.clone();
 
-    //     b.insert(hash(1), 11);
-    //     b.insert(hash(3), 30);
+        b.insert(hash(1), 11);
+        b.insert(hash(3), 30);
 
-    //     let mut c = b.clone();
+        let mut c = b.clone();
 
-    //     c.insert(hash(1), 111);
+        c.insert(hash(1), 111);
 
-    //     assert_eq!(*a.get(hash(1)).unwrap(), 10);
-    //     assert_eq!(*a.get(hash(2)).unwrap(), 20);
-    //     assert_eq!(a.get(hash(3)), None);
+        assert_eq!(a.get(&hash(1)), Some(10));
+        assert_eq!(a.get(&hash(2)), Some(20));
+        assert_eq!(a.get(&hash(3)), None);
 
-    //     assert_eq!(*b.get(hash(1)).unwrap(), 11);
-    //     assert_eq!(*b.get(hash(2)).unwrap(), 20);
-    //     assert_eq!(*b.get(hash(3)).unwrap(), 30);
+        assert_eq!(b.get(&hash(1)), Some(11));
+        assert_eq!(b.get(&hash(2)), Some(20));
+        assert_eq!(b.get(&hash(3)), Some(30));
 
-    //     assert_eq!(*c.get(hash(1)).unwrap(), 111);
+        assert_eq!(c.get(&hash(1)), Some(111));
 
-    //     // change old values
-    //     a.insert(hash(1), 1111);
+        // change old values
+        a.insert(hash(1), 1111);
 
-    //     assert_eq!(*a.get(hash(1)).unwrap(), 1111);
-    //     assert_eq!(*b.get(hash(1)).unwrap(), 11);
-    //     assert_eq!(*c.get(hash(1)).unwrap(), 111);
-    // }
+        assert_eq!(a.get(&hash(1)), Some(1111));
+        assert_eq!(b.get(&hash(1)), Some(11));
+        assert_eq!(c.get(&hash(1)), Some(111));
+    }
+
+    #[test]
+    fn copy_on_write_remove() {
+        let mut a = Trie::<[u8; 8], usize>::new();
+
+        let lots = 100_000;
+        for i in 0..lots {
+            a.insert(hash(i), i);
+        }
+
+        let mut b = a.clone();
+
+        b.remove(&hash(0));
+        b.remove(&hash(1));
+
+        let mut c = b.clone();
+
+        c.remove(&hash(2));
+
+        assert_eq!(a.get(&hash(0)), Some(0));
+        assert_eq!(a.get(&hash(1)), Some(1));
+        assert_eq!(a.get(&hash(2)), Some(2));
+
+        assert_eq!(b.get(&hash(0)), None);
+        assert_eq!(b.get(&hash(1)), None);
+        assert_eq!(b.get(&hash(2)), Some(2));
+
+        assert_eq!(c.get(&hash(0)), None);
+        assert_eq!(c.get(&hash(1)), None);
+        assert_eq!(c.get(&hash(2)), None);
+
+    }
 }
