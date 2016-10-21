@@ -19,6 +19,12 @@ enum Child<K, V> {
     None,
 }
 
+enum RemoveResult<K, V> {
+    Done,
+    Clear,
+    PassUp(Child<K, V>),
+}
+
 struct Children<K, V>([Child<K, V>; 16]);
 
 impl<K, V> Index<usize> for Children<K, V> {
@@ -31,12 +37,6 @@ impl<K, V> Index<usize> for Children<K, V> {
 impl<K, V> IndexMut<usize> for Children<K, V> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.0[index]
-    }
-}
-
-impl<K, V> Children<K, V> {
-    fn take(&mut self, i: usize) -> Child<K, V> {
-        mem::replace(&mut self.0[i], Child::None)
     }
 }
 
@@ -54,7 +54,34 @@ impl<K, V> Children<K, V> {
              Child::None, Child::None, Child::None, Child::None,
              Child::None, Child::None, Child::None, Child::None])
     }
+    fn take(&mut self, i: usize) -> Child<K, V> {
+        mem::replace(&mut self.0[i], Child::None)
+    }
+    fn singleton_idx(&self) -> Option<usize> {
+        let mut singleton = None;
+        for i in 0..16 {
+            if let Child::None = self.0[i] {
+            } else if singleton == None {
+                singleton = Some(i);
+            } else {
+                return None
+            }
+        }
+        singleton
+    }
+    fn singleton_leaf(&mut self) -> Option<Child<K, V>> {
+        self.singleton_idx().and_then(|i| {
+            match self.0[i] {
+                Child::Leaf{ .. } => Some(self.take(i)),
+                _ => None,
+            }
+        })
+    }
+    fn singleton(&mut self) -> bool {
+        self.singleton_idx().is_some()
+    }
 }
+
 
 impl<K, V> Trie<K, V>
     where K: PartialEq + AsRef<[u8]> + Debug + Clone,
@@ -136,39 +163,42 @@ impl<K, V> Trie<K, V>
         self.remove_depth(key, 0);
     }
 
-    fn remove_depth(&mut self, key: &K, depth: usize) -> Option<Child<K, V>> {
+    fn remove_depth(&mut self, key: &K, depth: usize) -> RemoveResult<K, V>
+    {
         let i = nibble(key.as_ref(), depth);
-        {
-            let mut writelock = self.children.write();
-            let ref mut child = writelock[i];
-            let mut overwrite = None;
-            match *child {
-                Child::Leaf { key: ref leafkey, .. } if key == leafkey => {
-                    overwrite = Some(Child::None)
-                },
-                Child::None | Child::Leaf{ .. } => (),
-                Child::Trie(ref mut trie) => {
-                    overwrite = trie.remove_depth(key, depth + 1);
+        let ref mut writelock = self.children.write();
+        let result = match writelock[i] {
+            Child::Leaf { key: ref leafkey, .. } if key == leafkey => {
+                RemoveResult::Clear
+            },
+            Child::None | Child::Leaf{ .. } => RemoveResult::Done,
+            Child::Trie(ref mut trie) => {
+                match trie.remove_depth(key, depth + 1) {
+                    RemoveResult::PassUp(passed) => RemoveResult::PassUp(passed),
+                    _ => RemoveResult::Done,
                 }
             }
-            overwrite.map(|c| { *child = c });
-        }
-        if depth > 0 {
-            let mut singleton = None;
-            let mut children = self.children.write();
-            for i in 0..16 {
-                if let Child::None = children[i] {
-                } else if singleton == None {
-                    singleton = Some(i);
+        };
+        // Enact the change and cascade up if producing singleton tries
+        match result {
+            RemoveResult::Done => RemoveResult::Done,
+            RemoveResult::Clear => {
+                writelock[i] = Child::None;
+                match writelock.singleton_leaf() {
+                    Some(single) => {
+                        RemoveResult::PassUp(single)
+                    }
+                    None => RemoveResult::Done,
+                }
+            }
+            RemoveResult::PassUp(passed) => {
+                if writelock.singleton() {
+                    RemoveResult::PassUp(passed)
                 } else {
-                    return None
+                    writelock[i] = passed;
+                    RemoveResult::Done
                 }
             }
-            singleton.map(|idx| {
-                children.take(idx)
-            })
-        } else {
-            None
         }
     }
 
@@ -284,48 +314,46 @@ mod tests {
         }
     }
 
-    // #[test]
-    // fn removal() {
-    //     let lots = 100_000;
-    //     let mut trie = Trie::<[u8; 8], usize>::new();
-    //     for i in 0..lots {
-    //         trie.insert(hash(i), i);
-    //     }
+    #[test]
+    fn removal() {
+        let lots = 100_000;
+        let mut trie = Trie::<[u8; 8], usize>::new();
+        for i in 0..lots {
+            trie.insert(hash(i), i);
+        }
 
-    //     for i in 0..lots/2 {
-    //         trie.remove(&hash(i*2));
-    //     }
+        for i in 0..lots {
+            if i % 2 == 0 {
+                trie.remove(&hash(i));
+            }
+        }
 
-    //     for i in 0..lots {
-    //         if i % 2 == 0 {
-    //             assert_eq!(trie.get(&hash(i)), None);
-    //         } else {
-    //             assert_eq!(trie.get(&hash(i)), Some(i));
-    //         }
-    //     }
-    // }
+        for i in 0..lots {
+            if i % 2 == 0 {
+                assert_eq!(trie.get(&hash(i)), None);
+            } else {
+                assert_eq!(trie.get(&hash(i)), Some(i));
+            }
+        }
+    }
 
     #[test]
     fn remove_all() {
-        let from = 17;
-        let lots = 20;
+
+        let lots = 100_000;
+
         let mut trie = Trie::<[u8; 8], usize>::new();
-        for i in from..lots {
+        for i in 0..lots {
             trie.insert(hash(i), i as usize);
         }
 
-        println!("ALL: {:?}", trie);
-
-        for i in from..lots {
+        for i in 0..lots {
             trie.remove(&hash(i));
-            println!("removed {} {:?}", i, trie);
         }
 
-        for i in from..lots {
+        for i in 0..lots {
             assert_eq!(trie.get(&hash(i)), None);
         }
-
-        println!("leftovers:\n{:#?}", trie);
 
         assert!(trie._empty());
     }
