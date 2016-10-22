@@ -8,8 +8,10 @@ use parking_lot::{RwLock, RwLockWriteGuard, RwLockReadGuard};
 
 use std::fmt::{self, Debug};
 
-#[derive(Clone)]
-pub enum Child<K, V> {
+#[derive(PartialEq, Clone)]
+pub enum Child<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     Trie(Trie<K, V>),
     Leaf {
         key: K,
@@ -18,33 +20,54 @@ pub enum Child<K, V> {
     None,
 }
 
-enum RemoveResult<K, V> {
+enum RemoveResult<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     Done,
     Clear,
     PassUp(Child<K, V>),
 }
 
-pub struct Children<K, V>([Child<K, V>; 16]);
+#[derive(PartialEq)]
+pub struct Children<K, V>([Child<K, V>; 16])
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug;
 
-impl<K, V> Index<usize> for Children<K, V> {
+impl<K, V> Index<usize> for Children<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     type Output = Child<K, V>;
     fn index<'a>(&'a self, index: usize) -> &'a Self::Output {
         &self.0[index]
     }
 }
 
-impl<K, V> IndexMut<usize> for Children<K, V> {
+impl<K, V> IndexMut<usize> for Children<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.0[index]
     }
 }
 
-pub struct Trie<K, V> {
+pub struct Trie<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     children: Arc<RwLock<Children<K, V>>>,
     cow: Arc<AtomicBool>,
 }
 
-impl<K, V> Clone for Trie<K, V> {
+impl<K, V> PartialEq for Trie<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
+    fn eq(&self, other: &Self) -> bool {
+        *self.readable_children() == *other.readable_children()
+    }
+}
+
+impl<K, V> Clone for Trie<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     fn clone(&self) -> Self {
         self.cow.store(true, Ordering::Relaxed);
         Trie {
@@ -54,7 +77,9 @@ impl<K, V> Clone for Trie<K, V> {
     }
 }
 
-impl<K, V> Children<K, V> {
+impl<K, V> Children<K, V>
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     pub fn new() -> Self {
         Children(
             [Child::None, Child::None, Child::None, Child::None,
@@ -92,8 +117,8 @@ impl<K, V> Children<K, V> {
 
 
 impl<K, V> Trie<K, V>
-    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
-          V: Clone + Debug {
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     pub fn new() -> Self {
         Trie {
             children: Arc::new(RwLock::new(Children::new())),
@@ -101,26 +126,36 @@ impl<K, V> Trie<K, V>
         }
     }
 
+    pub fn new_cow(cow: Arc<AtomicBool>) -> Self {
+        Trie {
+            children: Arc::new(RwLock::new(Children::new())),
+            cow: cow,
+        }
+    }
+
     fn put(&mut self, idx: usize, child: Child<K, V>, cow: Arc<AtomicBool>) {
         self.writable_children(cow)[idx] = child;
     }
 
-    fn new_from(akey: K,
-                aval: V,
-                bkey: K,
-                bval: V,
-                depth: usize,
-                cow: Arc<AtomicBool>) -> Self {
+    fn new_from(
+        akey: K,
+        aval: V,
+        bkey: K,
+        bval: V,
+        depth: usize,
+        cow: Arc<AtomicBool>) -> Self
+    {
         let mut trie = Trie::new();
         let na = nibble(akey.as_ref(), depth);
         let nb = nibble(bkey.as_ref(), depth);
         if na == nb {
-            let newtrie = Trie::new_from(akey,
-                                         aval,
-                                         bkey,
-                                         bval,
-                                         depth + 1,
-                                         cow.clone());
+            let newtrie = Trie::new_from(
+                akey,
+                aval,
+                bkey,
+                bval,
+                depth + 1,
+                cow.clone());
             trie.put(na, Child::Trie(newtrie), cow);
         } else {
             trie.put(na, Child::Leaf { key: akey, val: aval }, cow.clone());
@@ -188,10 +223,11 @@ impl<K, V> Trie<K, V>
         self.remove_depth(key, 0, Arc::new(AtomicBool::new(false)));
     }
 
-    fn remove_depth(&mut self,
-                    key: &K,
-                    depth: usize,
-                    cow: Arc<AtomicBool>) -> RemoveResult<K, V>
+    fn remove_depth(
+        &mut self,
+        key: &K,
+        depth: usize,
+        cow: Arc<AtomicBool>) -> RemoveResult<K, V>
     {
         let i = nibble(key.as_ref(), depth);
         let ref mut writelock = self.writable_children(cow.clone());
@@ -255,6 +291,66 @@ impl<K, V> Trie<K, V>
         }
         true
     }
+
+    pub fn union(&self, other: &Trie<K, V>) -> Trie<K, V> {
+        self.union_depth(other, 0, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn union_depth(
+        &self,
+        other: &Trie<K, V>,
+        depth: usize,
+        cow: Arc<AtomicBool>
+    ) -> Trie<K, V> {
+        let mut union = Trie::new_cow(cow.clone());
+        {
+            let a = self.readable_children();
+            let b = other.readable_children();
+            let mut c = union.writable_children(cow.clone());
+            for i in 0..16 {
+                if a[i] == b[i] {
+                    c[i] == a[i].clone();
+                } else {
+                    c[i] = match (&a[i], &b[i]) {
+                        (&Child::None, &Child::None) => Child::None,
+
+                        (&Child::Leaf { ref key, ref val }, &Child::None) |
+                        (&Child::None, &Child::Leaf { ref key, ref val }) =>
+                            Child::Leaf { key: key.clone(), val: val.clone() },
+
+                        (&Child::Trie(ref trie), &Child::None) |
+                        (&Child::None, &Child::Trie(ref trie)) =>
+                            Child::Trie(trie.clone()),
+
+                        (&Child::Leaf { key: ref akey, val: ref aval },
+                         &Child::Leaf { key: ref bkey, val: ref bval }) =>
+                            Child::Trie(Trie::new_from(
+                                akey.clone(),
+                                aval.clone(),
+                                bkey.clone(),
+                                bval.clone(),
+                                depth + 1,
+                                cow.clone())),
+
+                        (&Child::Leaf { ref key, ref val }, &Child::Trie(ref trie)) |
+                        (&Child::Trie(ref trie), &Child::Leaf { ref key, ref val }) => {
+                            let mut trie = trie.clone();
+                            trie.insert_depth(
+                                key.clone(),
+                                val.clone(),
+                                depth + 1,
+                                cow.clone());
+                            Child::Trie(trie)
+                        },
+
+                        (&Child::Trie(ref a), &Child::Trie(ref b)) =>
+                            Child::Trie(a.union_depth(b, depth + 1, cow.clone())),
+                    }
+                }
+            }
+        }
+        union
+    }
 }
 
 /// Gets the nibble at position i
@@ -267,8 +363,8 @@ pub fn nibble(key: &[u8], i: usize) -> usize {
 }
 
 impl<K, V> fmt::Debug for Child<K, V>
-    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
-          V: Clone + Debug {
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
             Child::Leaf { ref val, .. } => {
@@ -283,8 +379,8 @@ impl<K, V> fmt::Debug for Child<K, V>
 }
 
 impl<K, V> fmt::Debug for Children<K, V>
-    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
-          V: Clone + Debug {
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         try!(write!(f, "[ "));
         for i in 0..16 {
@@ -299,8 +395,8 @@ impl<K, V> fmt::Debug for Children<K, V>
 }
 
 impl<K, V> fmt::Debug for Trie<K, V>
-    where K: PartialEq + AsRef<[u8]> + Debug + Clone,
-          V: Clone + Debug {
+    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
+          V: PartialEq + Clone + Debug {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "{:#?}", *self.readable_children())
     }
@@ -387,6 +483,33 @@ mod tests {
         }
 
         assert!(trie._empty());
+    }
+
+    #[test]
+    fn union() {
+        let lots = 100_000;
+        let mut a = Trie::<[u8; 8], usize>::new();
+        let mut b = Trie::<[u8; 8], usize>::new();
+        for i in 0..lots {
+            if i % 2 == 0 {
+                a.insert(hash(i), i);
+            } else {
+                b.insert(hash(i), i);
+            }
+        }
+
+        let union = a.union(&b);
+
+        for i in 0..lots {
+            assert_eq!(union.get(&hash(i)), Some(i));
+            if i % 2 == 0 {
+                assert_eq!(a.get(&hash(i)), Some(i));
+                assert_eq!(b.get(&hash(i)), None);
+            } else {
+                assert_eq!(a.get(&hash(i)), None);
+                assert_eq!(b.get(&hash(i)), Some(i));
+            }
+        }
     }
 
     #[test]
