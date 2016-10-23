@@ -1,4 +1,6 @@
 extern crate parking_lot;
+#[macro_use]
+extern crate trait_group;
 
 use std::mem;
 use std::sync::Arc;
@@ -8,10 +10,17 @@ use parking_lot::{RwLock, RwLockWriteGuard, RwLockReadGuard};
 
 use std::fmt::{self, Debug};
 
+trait_group! {
+    pub trait Key: PartialEq + Clone + Debug + AsRef<[u8]>
+}
+
+trait_group! {
+    pub trait Val: PartialEq + Clone + Debug
+}
+
 #[derive(PartialEq, Clone)]
 pub enum Child<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     Trie(Trie<K, V>),
     Leaf {
         key: K,
@@ -21,8 +30,7 @@ pub enum Child<K, V>
 }
 
 enum RemoveResult<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     Done,
     Clear,
     PassUp(Child<K, V>),
@@ -30,12 +38,10 @@ enum RemoveResult<K, V>
 
 #[derive(PartialEq)]
 pub struct Children<K, V>([Child<K, V>; 16])
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug;
+    where K: Key, V: Val;
 
 impl<K, V> Index<usize> for Children<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     type Output = Child<K, V>;
     fn index<'a>(&'a self, index: usize) -> &'a Self::Output {
         &self.0[index]
@@ -43,31 +49,27 @@ impl<K, V> Index<usize> for Children<K, V>
 }
 
 impl<K, V> IndexMut<usize> for Children<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.0[index]
     }
 }
 
 pub struct Trie<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     children: Arc<RwLock<Children<K, V>>>,
     cow: Arc<AtomicBool>,
 }
 
 impl<K, V> PartialEq for Trie<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     fn eq(&self, other: &Self) -> bool {
         *self.readable_children() == *other.readable_children()
     }
 }
 
 impl<K, V> Clone for Trie<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     fn clone(&self) -> Self {
         self.cow.store(true, Ordering::Relaxed);
         Trie {
@@ -78,8 +80,7 @@ impl<K, V> Clone for Trie<K, V>
 }
 
 impl<K, V> Children<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     pub fn new() -> Self {
         Children(
             [Child::None, Child::None, Child::None, Child::None,
@@ -117,8 +118,7 @@ impl<K, V> Children<K, V>
 
 
 impl<K, V> Trie<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     pub fn new() -> Self {
         Trie {
             children: Arc::new(RwLock::new(Children::new())),
@@ -363,8 +363,7 @@ pub fn nibble(key: &[u8], i: usize) -> usize {
 }
 
 impl<K, V> fmt::Debug for Child<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
             Child::Leaf { ref val, .. } => {
@@ -379,8 +378,7 @@ impl<K, V> fmt::Debug for Child<K, V>
 }
 
 impl<K, V> fmt::Debug for Children<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         try!(write!(f, "[ "));
         for i in 0..16 {
@@ -395,8 +393,7 @@ impl<K, V> fmt::Debug for Children<K, V>
 }
 
 impl<K, V> fmt::Debug for Trie<K, V>
-    where K: PartialEq + Clone + Debug + AsRef<[u8]>,
-          V: PartialEq + Clone + Debug {
+    where K: Key, V: Val {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(f, "{:#?}", *self.readable_children())
     }

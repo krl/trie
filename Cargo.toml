@@ -7,6 +7,7 @@ version = "0.1.0"
 byteorder = "0.5.3"
 parking_lot = "0.3.5"
 rand = "0.3.14"
+trait-group = "0.1.0"
 
 [dependencies.content]
 path = "../content"
