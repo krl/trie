@@ -280,6 +280,24 @@ impl<K, V> Trie<K, V>
         }
     }
 
+    pub fn update<U>(&mut self, key: &K, update: U) where U: Fn(&V) -> V {
+        self.update_depth(key, update, 0, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn update_depth<U>(
+        &mut self, key: &K, update: U, depth: usize, cow: Arc<AtomicBool>
+    ) where U: Fn(&V) -> V {
+        let i = nibble(key.as_ref(), depth);
+        let ref mut writelock = self.writable_children(cow.clone());
+        match writelock[i] {
+            Child::Leaf { key: ref leafkey, ref mut val } if leafkey == key =>
+                *val = update(val),
+            Child::Leaf { .. } | Child::None => (),
+            Child::Trie(ref mut trie) => trie.update_depth(key, update, depth + 1, cow)
+        }
+    }
+
+
     // test use only
     fn _empty(&self) -> bool {
         let children = self.readable_children();
@@ -480,6 +498,42 @@ mod tests {
         }
 
         assert!(trie._empty());
+    }
+
+    #[test]
+    fn update() {
+        let lots = 100_000;
+        let mut trie = Trie::<[u8; 8], usize>::new();
+        for i in 0..lots {
+            trie.insert(hash(i), i);
+        }
+        for i in 0..lots {
+            trie.update(&hash(i), |x| x + 1);
+        }
+        for i in 0..lots {
+            assert_eq!(trie.get(&hash(i)), Some(i + 1));
+        }
+    }
+
+    #[test]
+    fn tries_in_a_trie() {
+        let mut trietrie = Trie::<[u8; 8], Trie<[u8; 8], usize>>::new();
+        let many = 1000;
+
+        for i in 0..many {
+            let mut trie = Trie::<[u8; 8], usize>::new();
+            for o in 0..many {
+                trie.insert(hash(o), o * i);
+            }
+            trietrie.insert(hash(i), trie);
+        }
+
+        for i in 0..many {
+            for o in 0..many {
+                assert_eq!(trietrie.get(&hash(i)).unwrap().get(&hash(o)),
+                           Some(o * i));
+            }
+        }
     }
 
     #[test]
